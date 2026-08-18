@@ -1,0 +1,4 @@
+state.json
+node_modules/
+*.sqlite3
+.env

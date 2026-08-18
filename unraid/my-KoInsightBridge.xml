@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<!--
+  Unraid template. Copy to /boot/config/plugins/dockerMan/templates-user/
+  and fill in the masked fields (BOOKLORE_PASS, DB_PASS) plus your library path.
+
+  The image is built locally:
+    docker build -t local/koinsight-bridge:1.1 /path/to/this/repo
+-->
+<Container version="2">
+  <Name>KoInsightBridge</Name>
+  <Repository>local/koinsight-bridge:1.1</Repository>
+  <Registry/>
+  <Network>server-network</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/lucasalbini/koinsight-booklore-bridge/issues</Support>
+  <Project>https://github.com/lucasalbini/koinsight-booklore-bridge</Project>
+  <Overview>Bridge between KoInsight and BookLore. Every cycle it reads the page statistics KOReader uploaded to KoInsight, groups them into reading sessions (per device, split on pauses longer than GAP_MINUTES) and posts them to BookLore's /api/v1/reading-sessions, feeding its heatmap and timeline. Highlights and notes are converted from KOReader XPointers to EPUB CFIs and posted to /api/v1/annotations. Books are matched by KOReader's partial md5, the same value BookLore stores in book_file.current_hash; unmatched books are skipped.</Overview>
+  <Category>Productivity: Tools:</Category>
+  <WebUI/>
+  <Icon>https://raw.githubusercontent.com/koreader/koreader/master/resources/koreader.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <Config Name="state" Target="/data" Default="/mnt/user/appdata/koinsight-bridge" Mode="rw" Description="Holds state.json, the watermark of what has already been imported" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/koinsight-bridge</Config>
+  <Config Name="books" Target="/books" Default="" Mode="ro" Description="Read-only library, the same one BookLore indexes. Required for highlights: converting a KOReader XPointer into a CFI means opening the EPUB and counting the elements of the chapter" Type="Path" Display="always" Required="false" Mask="false"/>
+  <Config Name="KOINSIGHT_URL" Target="KOINSIGHT_URL" Default="http://KoInsight:3000" Mode="" Description="Internal URL of KoInsight" Type="Variable" Display="always" Required="true" Mask="false">http://KoInsight:3000</Config>
+  <Config Name="BOOKLORE_URL" Target="BOOKLORE_URL" Default="http://BookLore:6060" Mode="" Description="Internal URL of BookLore" Type="Variable" Display="always" Required="true" Mask="false">http://BookLore:6060</Config>
+  <Config Name="BOOKLORE_USER" Target="BOOKLORE_USER" Default="" Mode="" Description="BookLore account that owns the sessions" Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="BOOKLORE_PASS" Target="BOOKLORE_PASS" Default="" Mode="" Description="BookLore password" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="DB_HOST" Target="DB_HOST" Default="MariaDB" Mode="" Description="MariaDB host (read-only query mapping md5 to book_id)" Type="Variable" Display="advanced" Required="true" Mask="false">MariaDB</Config>
+  <Config Name="DB_PASS" Target="DB_PASS" Default="" Mode="" Description="Password of the booklore user in MariaDB" Type="Variable" Display="advanced" Required="true" Mask="true"/>
+  <Config Name="GAP_MINUTES" Target="GAP_MINUTES" Default="30" Mode="" Description="A pause longer than this closes a reading session" Type="Variable" Display="always" Required="false" Mask="false">30</Config>
+  <Config Name="INTERVAL_SECONDS" Target="INTERVAL_SECONDS" Default="900" Mode="" Description="Seconds between cycles" Type="Variable" Display="always" Required="false" Mask="false">900</Config>
+  <Config Name="MIN_SESSION_SECONDS" Target="MIN_SESSION_SECONDS" Default="0" Mode="" Description="Drops sessions shorter than this (0 imports everything)" Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
+  <Config Name="SYNC_ANNOTATIONS" Target="SYNC_ANNOTATIONS" Default="1" Mode="" Description="1 = import highlights and notes besides sessions" Type="Variable" Display="always" Required="false" Mask="false">1</Config>
+  <Config Name="LIBRARY_ROOT" Target="LIBRARY_ROOT" Default="/books" Mode="" Description="Where the library is mounted inside this container" Type="Variable" Display="advanced" Required="false" Mask="false">/books</Config>
+  <Config Name="DRY_RUN" Target="DRY_RUN" Default="0" Mode="" Description="1 = only log what would be imported, without writing" Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
+</Container>

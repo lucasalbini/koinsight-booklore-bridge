@@ -1,0 +1,45 @@
+services:
+  koinsight-bridge:
+    build: .
+    # or, once you have published your own image:
+    # image: ghcr.io/<user>/koinsight-booklore-bridge:latest
+    container_name: koinsight-bridge
+    restart: unless-stopped
+    environment:
+      TZ: America/Sao_Paulo
+
+      KOINSIGHT_URL: http://koinsight:3000
+      BOOKLORE_URL: http://booklore:6060
+
+      # BookLore account that will own the sessions and highlights
+      BOOKLORE_USER: your-user
+      BOOKLORE_PASS: your-password
+
+      # BookLore's MariaDB, read-only: used to map KOReader's md5 to a book id
+      DB_HOST: mariadb
+      DB_NAME: booklore
+      DB_USER: booklore
+      DB_PASS: your-db-password
+
+      # A pause longer than this closes a reading session
+      GAP_MINUTES: "30"
+      # Seconds between cycles
+      INTERVAL_SECONDS: "900"
+      # Drop sessions shorter than this (0 imports everything)
+      MIN_SESSION_SECONDS: "0"
+      # Set to 0 to import reading sessions only
+      SYNC_ANNOTATIONS: "1"
+      # Set to 1 to log what would be imported without writing anything
+      DRY_RUN: "0"
+    volumes:
+      # Keeps state.json, the watermark of what has already been imported
+      - ./data:/data
+      # Same library BookLore indexes. Required for highlights: converting a
+      # KOReader XPointer into a CFI means opening the EPUB.
+      - /path/to/your/books:/books:ro
+    networks:
+      - booklore
+
+networks:
+  booklore:
+    external: true
