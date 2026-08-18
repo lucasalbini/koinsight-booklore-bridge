@@ -35,13 +35,20 @@ BookLore exposes no endpoint that answers *"which book has this md5?"* — its `
 
 ## Running it
 
-Docker Compose: copy `docker-compose.yml`, fill in the credentials and paths, then `docker compose up -d --build`.
+Prebuilt images (`linux/amd64` and `linux/arm64`) are published on every push to `main`:
 
-Unraid: build the image and drop the template in place.
+```
+ghcr.io/lucasalbini/koinsight-booklore-bridge:latest
+```
+
+Docker Compose: copy `docker-compose.yml`, fill in the credentials and paths, then `docker compose up -d`.
+
+Unraid: point the template at the image above, or build it yourself and use `local/koinsight-bridge:1.1`.
 
 ```bash
-docker build -t local/koinsight-bridge:1.1 .
 cp unraid/my-KoInsightBridge.xml /boot/config/plugins/dockerMan/templates-user/
+# building from source instead of pulling:
+docker build -t local/koinsight-bridge:1.1 .
 ```
 
 Start with `DRY_RUN=1` to see what would be imported without writing anything.

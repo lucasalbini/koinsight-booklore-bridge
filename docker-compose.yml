@@ -1,8 +1,8 @@
 services:
   koinsight-bridge:
-    build: .
-    # or, once you have published your own image:
-    # image: ghcr.io/<user>/koinsight-booklore-bridge:latest
+    image: ghcr.io/lucasalbini/koinsight-booklore-bridge:latest
+    # or build it yourself:
+    # build: .
     container_name: koinsight-bridge
     restart: unless-stopped
     environment:
