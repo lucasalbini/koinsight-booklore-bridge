@@ -7,12 +7,17 @@
  * POST /api/v1/reading-sessions. Highlights and notes are converted from
  * KOReader XPointers to EPUB CFIs and pushed to POST /api/v1/annotations.
  *
+ * Annotations are kept in step, not just imported once: a fingerprint of what
+ * was sent is stored per annotation, so a note written on an old highlight is
+ * pushed with PUT, and a highlight whose text changed is recreated.
+ *
  * Books are matched by KOReader's partial md5, which is the very same value
  * BookLore stores in book_file.current_hash (the one its progress sync already
  * relies on). Books with no match are skipped.
  */
 
 const fs = require('fs');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const epubcfi = require('./epubcfi');
 
@@ -199,17 +204,66 @@ function annotationKey(a) {
   return [a.book_md5, a.datetime, a.page_ref || a.pos0 || ''].join('|');
 }
 
-async function postAnnotation(token, body) {
-  const res = await fetch(`${cfg.bookloreUrl}/api/v1/annotations`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
+const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 16);
+
+/* Two fingerprints per annotation. `shape` covers what only a delete + create
+ * can fix, since BookLore's PUT accepts colour/style/note alone; `fp` covers
+ * everything the bridge sends, so an edit made in KOReader long after the first
+ * import — typically a note written on an old highlight — is still noticed. */
+function fingerprints(a) {
+  const text = (a.text || a.note || '').trim();
+  const shape = sha(JSON.stringify([text, a.pos1 || '']));
+  return {
+    shape,
+    fp: sha(JSON.stringify([shape, a.note || '', a.color || '', a.drawer || '', a.chapter || ''])),
+  };
+}
+
+async function annotationRequest(token, path, method, body) {
+  const res = await fetch(`${cfg.bookloreUrl}/api/v1/annotations${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
   });
   if (!res.ok) {
     const detail = (await res.text()).slice(0, 200);
     const duplicate = /duplicate|constraint|already exists/i.test(detail);
     throw Object.assign(new Error(`HTTP ${res.status} ${detail}`), { duplicate });
   }
+  if (res.status === 204) return null;
+  return res.json().catch(() => null);
+}
+
+const postAnnotation = (token, body) => annotationRequest(token, '', 'POST', body);
+const deleteAnnotation = (token, id) => annotationRequest(token, `/${id}`, 'DELETE');
+const putAnnotation = (token, id, body) =>
+  annotationRequest(token, `/${id}`, 'PUT', {
+    color: body.color,
+    style: body.style,
+    note: body.note === undefined ? null : body.note,
+  });
+
+/* State written before 1.2 has no BookLore id, so it is recovered once from the
+ * book's annotation list. */
+async function remoteAnnotations(token, bookId, cache) {
+  if (!cache.has(bookId)) {
+    cache.set(bookId, (await annotationRequest(token, `/book/${bookId}`, 'GET')) || []);
+  }
+  return cache.get(bookId);
+}
+
+function recordAnnotation(state, annotation, cfi, id, extra) {
+  state.annotations[annotation.key] = {
+    status: 'ok',
+    cfi,
+    shape: annotation.shape,
+    fp: annotation.fp,
+    ...(id != null ? { id } : {}),
+    ...extra,
+  };
 }
 
 async function importAnnotations(books, state, tokenFactory) {
@@ -217,21 +271,29 @@ async function importAnnotations(books, state, tokenFactory) {
   for (const book of books) {
     for (const annotation of book.annotations || []) {
       const key = annotationKey({ ...annotation, book_md5: book.md5 });
-      if (state.annotations[key]) continue;
-      pending.push({ ...annotation, md5: book.md5, title: book.title, key });
+      const prev = state.annotations[key];
+      /* A recorded failure is not retried: its reason does not change on its own. */
+      if (prev && prev.status !== 'ok') continue;
+      const { shape, fp } = fingerprints(annotation);
+      /* Untouched since the last import. Entries carrying no fingerprint predate
+       * 1.2 and are reconciled against BookLore once. */
+      if (prev && prev.fp === fp) continue;
+      pending.push({ ...annotation, md5: book.md5, title: book.title, key, prev, shape, fp });
     }
   }
   if (!pending.length) return;
 
   const targets = resolveBooks([...new Set(pending.map((a) => a.md5))]);
   const spineCache = new Map();
-  let imported = 0;
-  let failed = 0;
+  const remoteCache = new Map();
+  const counts = { imported: 0, updated: 0, recreated: 0, reconciled: 0, failed: 0 };
   let token = null;
 
   for (const annotation of pending) {
     const target = targets.get(annotation.md5);
+    const prev = annotation.prev;
     const text = (annotation.text || annotation.note || '').trim();
+    let cfi = null;
     try {
       if (!target) throw new Error('no matching book in BookLore');
       if (!text) throw new Error('annotation has no text (likely a bookmark)');
@@ -245,7 +307,7 @@ async function importAnnotations(books, state, tokenFactory) {
       if (!spineCache.has(target.filePath)) {
         spineCache.set(target.filePath, epubcfi.loadSpine(target.filePath));
       }
-      const cfi = epubcfi.xPointerToCfi(target.filePath, spineCache.get(target.filePath), pos0, annotation.pos1);
+      cfi = epubcfi.xPointerToCfi(target.filePath, spineCache.get(target.filePath), pos0, annotation.pos1);
 
       const body = {
         bookId: target.bookId,
@@ -258,31 +320,77 @@ async function importAnnotations(books, state, tokenFactory) {
       };
 
       if (cfg.dryRun) {
-        log(`  [dry run] highlight book ${target.bookId} "${annotation.title}" ${cfi} :: ${text.slice(0, 60)}`);
-        imported++;
+        const verb = prev ? 'update' : 'highlight';
+        log(`  [dry run] ${verb} book ${target.bookId} "${annotation.title}" ${cfi} :: ${text.slice(0, 60)}`);
+        counts[prev ? 'updated' : 'imported']++;
         continue;
       }
 
       token = token || (await tokenFactory());
-      await postAnnotation(token, body);
-      state.annotations[annotation.key] = { status: 'ok', cfi };
-      imported++;
-      log(`  highlight imported: book ${target.bookId} "${annotation.title}" ${cfi}`);
+
+      let id = prev ? prev.id : undefined;
+      let recreate = prev && prev.shape !== undefined && prev.shape !== annotation.shape;
+      if (prev && id === undefined) {
+        /* Match on the CFI, falling back to the text for entries recorded as
+         * duplicates, which never got one. */
+        const remote = await remoteAnnotations(token, target.bookId, remoteCache);
+        const match = remote.find((r) => r.cfi === cfi) || remote.find((r) => r.text === body.text);
+        id = match ? match.id : null;
+        if (match) {
+          recreate = match.cfi !== cfi || match.text !== body.text;
+          /* Already identical in BookLore: adopt the id and fingerprint instead
+           * of spending a PUT on every pre-1.2 annotation. */
+          const same = (match.note || '') === (body.note || '') &&
+            match.color === body.color && match.style === body.style;
+          if (!recreate && same) {
+            recordAnnotation(state, annotation, cfi, id);
+            counts.reconciled++;
+            continue;
+          }
+        }
+      }
+
+      if (!prev || id === null) {
+        /* Never imported, or deleted in BookLore since. */
+        const created = await postAnnotation(token, body);
+        recordAnnotation(state, annotation, cfi, created && created.id);
+        counts.imported++;
+        log(`  highlight imported: book ${target.bookId} "${annotation.title}" ${cfi}`);
+      } else if (recreate) {
+        /* The highlight itself moved or grew, and PUT cannot touch cfi/text. */
+        await deleteAnnotation(token, id);
+        const created = await postAnnotation(token, body);
+        recordAnnotation(state, annotation, cfi, created && created.id);
+        counts.recreated++;
+        log(`  highlight recreated: book ${target.bookId} "${annotation.title}" ${cfi}`);
+      } else {
+        await putAnnotation(token, id, body);
+        recordAnnotation(state, annotation, cfi, id);
+        counts.updated++;
+        log(`  highlight updated: book ${target.bookId} "${annotation.title}" ${cfi}${body.note ? ` :: ${body.note.slice(0, 60)}` : ' (note cleared)'}`);
+      }
     } catch (err) {
       if (err.duplicate) {
-        state.annotations[annotation.key] = { status: 'ok', duplicate: true };
+        /* BookLore already has it; the id is picked up on the next change. */
+        recordAnnotation(state, annotation, cfi, null, { duplicate: true });
         continue;
       }
-      failed++;
+      counts.failed++;
       /* Record the reason so the same attempt (and log line) is not repeated every cycle. */
-      if (!cfg.dryRun) state.annotations[annotation.key] = { status: 'failed', reason: err.message };
+      if (!cfg.dryRun) {
+        state.annotations[annotation.key] = { status: 'failed', reason: err.message };
+      }
       log(`  highlight skipped ("${annotation.title}"): ${err.message}`);
     }
   }
 
-  if (imported || failed) {
-    log(`highlights: ${imported} imported${cfg.dryRun ? ' (dry run)' : ''}, ${failed} skipped`);
-  }
+  const parts = [];
+  if (counts.imported) parts.push(`${counts.imported} imported`);
+  if (counts.updated) parts.push(`${counts.updated} updated`);
+  if (counts.recreated) parts.push(`${counts.recreated} recreated`);
+  if (counts.reconciled) parts.push(`${counts.reconciled} already in sync`);
+  if (counts.failed) parts.push(`${counts.failed} skipped`);
+  if (parts.length) log(`highlights: ${parts.join(', ')}${cfg.dryRun ? ' (dry run)' : ''}`);
 }
 
 async function cycle() {

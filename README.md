@@ -15,6 +15,7 @@ KOReader ──plugin──> KoInsight ──bridge──> BookLore
 - **Reading sessions.** Page statistics are grouped into sessions, split per device and cut on any pause longer than `GAP_MINUTES`. Session length is the **sum of per-page reading times**, not `end - start`, so a book left open on the table does not inflate your stats.
 - **Highlights and notes.** KOReader XPointers are converted into EPUB CFIs, so highlights land on the right words inside BookLore's web reader, keeping color, style, note and chapter title.
 - **No duplicates.** BookLore's API happily accepts the same session twice, so the bridge only imports sessions that have *cooled down* (nothing new for `GAP_MINUTES`) and keeps a watermark per book *and* device in `state.json`.
+- **Edits are followed.** Every annotation is fingerprinted in `state.json`, so a note you write on a highlight days after it was imported is pushed to BookLore with `PUT /api/v1/annotations/{id}`. If the highlight itself changed — different text or a different end position, which `PUT` cannot touch — it is deleted and recreated.
 
 ## How books are matched
 
@@ -43,12 +44,12 @@ ghcr.io/lucasalbini/koinsight-booklore-bridge:latest
 
 Docker Compose: copy `docker-compose.yml`, fill in the credentials and paths, then `docker compose up -d`.
 
-Unraid: point the template at the image above, or build it yourself and use `local/koinsight-bridge:1.1`.
+Unraid: point the template at the image above, or build it yourself and use `local/koinsight-bridge:1.2`.
 
 ```bash
 cp unraid/my-KoInsightBridge.xml /boot/config/plugins/dockerMan/templates-user/
 # building from source instead of pulling:
-docker build -t local/koinsight-bridge:1.1 .
+docker build -t local/koinsight-bridge:1.2 .
 ```
 
 Start with `DRY_RUN=1` to see what would be imported without writing anything.
@@ -89,7 +90,7 @@ One deliberate divergence: **ranges are emitted in the spec's three-part form**,
 `selftest.js` checks this against a real book: it builds XPointers the way KOReader would, converts them and walks the CFI back to the element, which must be the same one.
 
 ```bash
-docker run --rm -v /path/to/books:/books:ro local/koinsight-bridge:1.1 \
+docker run --rm -v /path/to/books:/books:ro local/koinsight-bridge:1.2 \
   node /app/selftest.js "/books/Author/Book.epub" p 5
 ```
 
@@ -98,6 +99,7 @@ docker run --rm -v /path/to/books:/books:ro local/koinsight-bridge:1.1 \
 - **EPUB only** for highlights. In PDFs KOReader stores page coordinates, which belong to a different BookLore endpoint (`PdfAnnotationController`). Those are logged as skipped.
 - **KOReader only uploads annotations for the book currently open** when syncing; the KoInsight plugin has a bulk option for the backlog.
 - Sessions are imported after they cool down, so the last one you read shows up on the next cycle rather than instantly.
+- Deleting a highlight in KOReader does **not** delete it in BookLore: KOReader simply stops listing it, which is indistinguishable from a book that was not synced.
 - An annotation that fails to convert is recorded in `state.json` with its reason and is not retried, to keep the log clean. Delete its entry to try again.
 - Reading **position** sync is untouched — that is BookLore's own KOReader progress sync and it stays as it is.
 
