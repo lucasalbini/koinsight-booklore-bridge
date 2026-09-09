@@ -215,7 +215,7 @@ function fingerprints(a) {
   const shape = sha(JSON.stringify([text, a.pos1 || '']));
   return {
     shape,
-    fp: sha(JSON.stringify([shape, a.note || '', a.color || '', a.drawer || '', a.chapter || ''])),
+    fp: sha(JSON.stringify([shape, a.note || '', a.color || '', a.drawer || '', a.chapter || '', epubcfi.VERSION])),
   };
 }
 
@@ -272,8 +272,9 @@ async function importAnnotations(books, state, tokenFactory) {
     for (const annotation of book.annotations || []) {
       const key = annotationKey({ ...annotation, book_md5: book.md5 });
       const prev = state.annotations[key];
-      /* A recorded failure is not retried: its reason does not change on its own. */
-      if (prev && prev.status !== 'ok') continue;
+      /* A recorded failure is not retried: its reason does not change on its
+       * own — unless the converter that produced it has since moved on. */
+      if (prev && prev.status !== 'ok' && prev.version === epubcfi.VERSION) continue;
       const { shape, fp } = fingerprints(annotation);
       /* Untouched since the last import. Entries carrying no fingerprint predate
        * 1.2 and are reconciled against BookLore once. */
@@ -307,7 +308,7 @@ async function importAnnotations(books, state, tokenFactory) {
       if (!spineCache.has(target.filePath)) {
         spineCache.set(target.filePath, epubcfi.loadSpine(target.filePath));
       }
-      cfi = epubcfi.xPointerToCfi(target.filePath, spineCache.get(target.filePath), pos0, annotation.pos1);
+      cfi = epubcfi.xPointerToCfi(target.filePath, spineCache.get(target.filePath), pos0, annotation.pos1, text);
 
       const body = {
         bookId: target.bookId,
@@ -329,7 +330,10 @@ async function importAnnotations(books, state, tokenFactory) {
       token = token || (await tokenFactory());
 
       let id = prev ? prev.id : undefined;
-      let recreate = prev && prev.shape !== undefined && prev.shape !== annotation.shape;
+      /* A stale CFI is recreated too: PUT cannot move a highlight, so a fix in
+       * the converter would otherwise never reach the copy already in BookLore. */
+      let recreate = prev && ((prev.shape !== undefined && prev.shape !== annotation.shape) ||
+        (prev.cfi !== undefined && prev.cfi !== cfi));
       if (prev && id === undefined) {
         /* Match on the CFI, falling back to the text for entries recorded as
          * duplicates, which never got one. */
@@ -378,7 +382,7 @@ async function importAnnotations(books, state, tokenFactory) {
       counts.failed++;
       /* Record the reason so the same attempt (and log line) is not repeated every cycle. */
       if (!cfg.dryRun) {
-        state.annotations[annotation.key] = { status: 'failed', reason: err.message };
+        state.annotations[annotation.key] = { status: 'failed', reason: err.message, version: epubcfi.VERSION };
       }
       log(`  highlight skipped ("${annotation.title}"): ${err.message}`);
     }

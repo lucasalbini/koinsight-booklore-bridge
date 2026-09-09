@@ -19,6 +19,19 @@ if (!epubPath) {
   process.exit(2);
 }
 
+/* Same rule the converter follows: KOReader's text().0 is the element's own
+ * first text child, and only when it has none does it reach into inline markup. */
+function firstTextNode(element) {
+  const direct = [...element.childNodes].find((n) => n.nodeType === 3);
+  if (direct) return direct;
+  for (const child of element.childNodes) {
+    if (child.nodeType !== 1) continue;
+    const nested = firstTextNode(child);
+    if (nested) return nested;
+  }
+  return null;
+}
+
 const spine = epubcfi.loadSpine(epubPath);
 console.log(`spine: ${spine.length} documents`);
 
@@ -42,11 +55,14 @@ for (let spineIndex = 0; spineIndex < spine.length && ok + fail < samples * 4; s
     try {
       const cfi = epubcfi.xPointerToCfi(epubPath, spine, xpointer, null);
       const contentPath = /^epubcfi\(\/6\/\d+!(.+)\)$/.exec(cfi)[1];
-      const resolved = epubcfi.resolveCfiElement(document, contentPath);
-      const expected = elements[nth - 1];
+      const resolved = epubcfi.resolveCfiTarget(document, contentPath);
+      const element = elements[nth - 1];
+      /* text().0 names the element's first text node, wherever inline markup
+       * put it, and that node is what the CFI has to come back to. */
+      const expected = firstTextNode(element);
       const same = resolved === expected;
       if (same) ok++; else fail++;
-      const preview = (expected.textContent || '').trim().slice(0, 40).replace(/\s+/g, ' ');
+      const preview = ((expected && expected.data) || '').trim().slice(0, 40).replace(/\s+/g, ' ');
       console.log(`  ${same ? 'ok  ' : 'FAIL'} DocFragment[${spineIndex + 1}] ${tag}[${nth}] -> ${cfi}  "${preview}"`);
     } catch (err) {
       fail++;

@@ -18,7 +18,7 @@ const { execFileSync } = require('child_process');
 const { parseHTML } = require('linkedom');
 
 const XPOINTER_RE = /^\/body\/DocFragment\[(\d+)\]\/body(.*)$/;
-const TEXT_OFFSET_RE = /\/text\(\)\.(\d+)$/;
+const TEXT_OFFSET_RE = /\/text\(\)(?:\[(\d+)\])?\.(\d+)$/;
 const SEGMENT_INDEXED_RE = /^(\w+)\[(\d+)\]$/;
 
 function unzipEntry(epubPath, entry) {
@@ -102,6 +102,70 @@ function resolveXPointerElement(document, elementPath) {
   return current;
 }
 
+/* CFI numbers an element's children over a virtual sequence: elements land on
+ * even steps and runs of character data on odd ones, so a text node's step is
+ * not always /1 once the paragraph carries inline markup. */
+function cfiStepOf(node) {
+  const parent = node.parentNode;
+  let step = 0;
+  let previousWasText = false;
+  for (const child of parent.childNodes) {
+    const isText = child.nodeType === 3;
+    if (isText && previousWasText) {
+      /* Adjacent text nodes are a single run and share one step. */
+    } else if (isText) {
+      step += step % 2 === 0 ? 1 : 2;
+    } else if (child.nodeType === 1) {
+      step += step % 2 === 0 ? 2 : 1;
+    } else {
+      continue;
+    }
+    previousWasText = isText;
+    if (child === node) return step;
+  }
+  throw new Error('text node is not a child of its own parent');
+}
+
+function collectTextNodes(element) {
+  const out = [];
+  const walk = (node) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) out.push(child);
+      else if (child.nodeType === 1) walk(child);
+    }
+  };
+  walk(element);
+  return out;
+}
+
+/* KOReader's text()[N] counts the element's own text children, which is all it
+ * takes while the markup stays flat. Some EPUBs nest <span> anchors inside one
+ * another (footnote and page markers), and there crengine's numbering stops
+ * lining up with the DOM's: the highlighted text is then what pins the node
+ * down, matched at the very offset KOReader reported. Failing that, the same
+ * index over every descendant text node is the closest guess. */
+function locateTextNode(element, parsed, text) {
+  const index = (parsed.textIndex || 1) - 1;
+  const direct = [...element.childNodes].filter((n) => n.nodeType === 3);
+  if (index < direct.length) return direct[index];
+
+  const all = collectTextNodes(element);
+  if (!all.length) throw new Error('element holds no text node');
+
+  if (text) {
+    const offset = parsed.textOffset || 0;
+    const match = all.find((node) => {
+      const rest = node.data.slice(offset);
+      if (!rest.length) return false;
+      const span = Math.min(rest.length, text.length);
+      return rest.slice(0, span) === text.slice(0, span);
+    });
+    if (match) return match;
+  }
+
+  return all[index] || all[0];
+}
+
 function buildCfiPath(element) {
   const parts = [];
   let current = element;
@@ -122,36 +186,64 @@ function buildCfiPath(element) {
 
 function parseXPointer(xpointer) {
   const offsetMatch = TEXT_OFFSET_RE.exec(xpointer);
-  const textOffset = offsetMatch ? Number(offsetMatch[1]) : null;
+  const textIndex = offsetMatch && offsetMatch[1] ? Number(offsetMatch[1]) : null;
+  const textOffset = offsetMatch ? Number(offsetMatch[2]) : null;
   const withoutOffset = xpointer.replace(TEXT_OFFSET_RE, '');
   const match = XPOINTER_RE.exec(withoutOffset);
   if (!match) throw new Error(`unexpected XPointer format: ${xpointer}`);
-  return { spineIndex: Number(match[1]) - 1, elementPath: match[2] || '', textOffset };
+  return { spineIndex: Number(match[1]) - 1, elementPath: match[2] || '', textIndex, textOffset };
 }
 
-/* Converts a KOReader pos0/pos1 pair into the CFI BookLore's reader understands. */
-function xPointerToCfi(epubPath, spine, pos0, pos1) {
+/* Resolves one end of a highlight to the CFI path of the text node's parent
+ * plus the step and offset that address the character inside it. */
+function locatePoint(document, parsed, text) {
+  const element = resolveXPointerElement(document, parsed.elementPath);
+  if (parsed.textOffset == null) {
+    return { path: buildCfiPath(element), step: null, offset: null, node: null };
+  }
+  const node = locateTextNode(element, parsed, text);
+  return {
+    path: buildCfiPath(node.parentElement),
+    step: cfiStepOf(node),
+    offset: parsed.textOffset,
+    node,
+  };
+}
+
+/* Converts a KOReader pos0/pos1 pair into the CFI BookLore's reader understands.
+ * `text` is the highlighted text; it is only consulted when the paragraph's
+ * nested markup makes text()[N] ambiguous. */
+function xPointerToCfi(epubPath, spine, pos0, pos1, text) {
   const start = parseXPointer(pos0);
   const document = loadSpineDocument(epubPath, spine, start.spineIndex);
   const spineStep = (start.spineIndex + 1) * 2;
 
-  const elementPathOf = (parsed) => buildCfiPath(resolveXPointerElement(document, parsed.elementPath));
-  const offsetOf = (parsed) => (parsed.textOffset != null ? `/1:${parsed.textOffset}` : '');
+  const suffix = (p) => (p.step == null ? '' : `/${p.step}:${p.offset}`);
 
-  const startPath = elementPathOf(start);
-  const point = () => `epubcfi(/6/${spineStep}!${startPath}${offsetOf(start)})`;
+  const startPoint = locatePoint(document, start, text);
+  const startPath = startPoint.path;
+  const point = () => `epubcfi(/6/${spineStep}!${startPath}${suffix(startPoint)})`;
 
   if (!pos1) return point();
 
   const end = parseXPointer(pos1);
   if (end.spineIndex !== start.spineIndex) throw new Error('highlight spans two DocFragments');
-  const endPath = elementPathOf(end);
+  /* pos1 names the same text node as pos0 in every highlight that stays inside
+   * one node, and it carries no text of its own to match on, so the node found
+   * for pos0 is reused rather than looked up again. */
+  const sameNode =
+    startPoint.node && end.elementPath === start.elementPath && end.textIndex === start.textIndex;
+  const endPoint = sameNode
+    ? { ...startPoint, offset: end.textOffset }
+    : locatePoint(document, end, null);
+  const endPath = endPoint.path;
 
   if (startPath === endPath) {
-    if (start.textOffset == null || end.textOffset == null || start.textOffset === end.textOffset) {
+    if (startPoint.step == null || endPoint.step == null ||
+        (startPoint.step === endPoint.step && startPoint.offset === endPoint.offset)) {
       return point();
     }
-    return `epubcfi(/6/${spineStep}!${startPath},/1:${start.textOffset},/1:${end.textOffset})`;
+    return `epubcfi(/6/${spineStep}!${startPath},${suffix(startPoint)},${suffix(endPoint)})`;
   }
 
   /* Different elements: the parent is the longest common run of steps. */
@@ -164,14 +256,14 @@ function xPointerToCfi(epubPath, spine, pos0, pos1) {
   if (common === startSteps.length || common === endSteps.length) common--;
   if (common < 1) throw new Error('highlight has no common ancestor');
 
-  const relative = (steps, parsed) => {
+  const relative = (steps, p) => {
     const rest = steps.slice(common);
     const path = rest.length ? `/${rest.join('/')}` : '';
-    return `${path}${offsetOf(parsed)}` || '/1:0';
+    return `${path}${suffix(p)}` || '/1:0';
   };
 
   const parent = `/${startSteps.slice(0, common).join('/')}`;
-  return `epubcfi(/6/${spineStep}!${parent},${relative(startSteps, start)},${relative(endSteps, end)})`;
+  return `epubcfi(/6/${spineStep}!${parent},${relative(startSteps, startPoint)},${relative(endSteps, endPoint)})`;
 }
 
 /* CFI back to the element; used only to check the conversion.
@@ -191,7 +283,51 @@ function resolveCfiElement(document, contentPath) {
   return current;
 }
 
+/* Bumped whenever the conversion itself changes, so annotations already in
+ * BookLore are revisited and their CFIs corrected instead of staying stale. */
+const VERSION = 2;
+
+/* CFI back to the node it addresses, text nodes included; used only to check
+ * the conversion. It walks the same odd/even numbering cfiStepOf produces. */
+function resolveCfiTarget(document, contentPath) {
+  const steps = [...contentPath.matchAll(/\/(\d+)(?::\d+)?/g)].map((m) => Number(m[1])).slice(1);
+  let current = document.body;
+  for (const step of steps) {
+    if (step % 2 === 0) {
+      const child = current.children[step / 2 - 1];
+      if (!child) return current;
+      current = child;
+      continue;
+    }
+    let index = 0;
+    let previousWasText = false;
+    let found = null;
+    for (const child of current.childNodes) {
+      const isText = child.nodeType === 3;
+      if (isText && previousWasText) {
+        /* Adjacent text nodes are a single run. */
+      } else if (isText) {
+        index += index % 2 === 0 ? 1 : 2;
+      } else if (child.nodeType === 1) {
+        index += index % 2 === 0 ? 2 : 1;
+      } else {
+        continue;
+      }
+      previousWasText = isText;
+      if (index === step && isText) {
+        found = child;
+        break;
+      }
+    }
+    if (!found) return current;
+    current = found;
+  }
+  return current;
+}
+
 module.exports = {
+  VERSION,
+  resolveCfiTarget,
   loadSpine,
   loadSpineDocument,
   xPointerToCfi,

@@ -77,7 +77,10 @@ KOReader marks positions with XPointers (`/body/DocFragment[7]/body/div/p[21]/te
 
 - the last indexed segment resolves **globally** in the chapter (KOReader numbers elements per tag across the whole DocFragment, not among siblings);
 - each CFI step is the element's position among its parent's element children times two, with `/4` for the body;
-- `DocFragment[N]` is the Nth spine item, so the spine step is `(N) * 2`.
+- `DocFragment[N]` is the Nth spine item, so the spine step is `(N) * 2`;
+- a text node's own step follows the CFI numbering, where elements take the even positions and runs of text the odd ones — so `/1` only holds while the paragraph opens with text. A paragraph starting with `<span>` puts its first text node on `/3`.
+
+KOReader addresses a text node with `text()` or, when the paragraph holds several, `text()[N]` — counting the element's own text children. Some EPUBs nest `<span>` markers (page and footnote anchors) inside one another, and there crengine's numbering no longer matches the DOM's. When the index does not resolve, the highlighted text itself is matched at the offset KOReader reported, which pins the node down exactly.
 
 One deliberate divergence: **ranges are emitted in the spec's three-part form**, `epubcfi(parent,start,end)`. BookLore's Java converter produces a two-part variant, but its own reader rejects that — `selection.service.ts` discards any CFI without exactly two relative parts, and foliate-js only paints highlights in the three-part shape.
 
@@ -87,7 +90,7 @@ One deliberate divergence: **ranges are emitted in the spec's three-part form**,
 | Single point | `epubcfi(/6/14!/4/42/1:10)` |
 | Range across paragraphs | `epubcfi(/6/14!/4,/42/1:5,/44/1:40)` |
 
-`selftest.js` checks this against a real book: it builds XPointers the way KOReader would, converts them and walks the CFI back to the element, which must be the same one.
+`selftest.js` checks this against a real book: it builds XPointers the way KOReader would, converts them and walks the CFI back to the text node, which must be the same one.
 
 ```bash
 docker run --rm -v /path/to/books:/books:ro local/koinsight-bridge:1.2 \
@@ -100,7 +103,8 @@ docker run --rm -v /path/to/books:/books:ro local/koinsight-bridge:1.2 \
 - **KOReader only uploads annotations for the book currently open** when syncing; the KoInsight plugin has a bulk option for the backlog.
 - Sessions are imported after they cool down, so the last one you read shows up on the next cycle rather than instantly.
 - Deleting a highlight in KOReader does **not** delete it in BookLore: KOReader simply stops listing it, which is indistinguishable from a book that was not synced.
-- An annotation that fails to convert is recorded in `state.json` with its reason and is not retried, to keep the log clean. Delete its entry to try again.
+- An annotation that fails to convert is recorded in `state.json` with its reason and is not retried, to keep the log clean. Delete its entry to try again, or bump `VERSION` in `epubcfi.js`.
+- `epubcfi.js` carries a `VERSION`, which is part of every annotation's fingerprint. Raising it after a change to the conversion makes the bridge revisit annotations already in BookLore: those whose CFI moved are deleted and recreated, and earlier failures are retried once.
 - Reading **position** sync is untouched — that is BookLore's own KOReader progress sync and it stays as it is.
 
 ## Credits and license
